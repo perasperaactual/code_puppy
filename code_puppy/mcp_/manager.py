@@ -153,16 +153,22 @@ class MCPManager:
     def sync_from_config(self) -> None:
         """Sync servers from mcp_servers.json into the registry.
 
-        This public method ensures that servers defined in the user's
-        configuration file are automatically registered with the manager.
-        It can be called during initialization or manually to reload
-        server configurations.
+        This method is the single authoritative sync from the user's
+        mcp_servers.json.  It adds/updates servers that appear in the file
+        AND removes registry entries that are no longer present, so that
+        mcp_registry.json never accumulates stale or dead entries.
 
-        This is the single source of truth for syncing mcp_servers.json
-        into the registry, avoiding duplication with base_agent.py.
+        When projectOnly mode is active, global config is skipped entirely.
         """
         try:
-            from code_puppy.config import load_mcp_server_configs
+            from code_puppy.config import is_project_only, load_mcp_server_configs
+
+            # In projectOnly mode, do not load global mcp_servers.json.
+            if is_project_only():
+                logger.debug(
+                    "projectOnly mode — skipping global mcp_servers.json"
+                )
+                return
 
             configs = load_mcp_server_configs()
             if not configs:
