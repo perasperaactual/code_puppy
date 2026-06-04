@@ -9,6 +9,7 @@ to agents.
 
 import asyncio
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
@@ -103,6 +104,7 @@ class ServerInfo:
     health: Optional[Dict[str, Any]] = None
     start_time: Optional[datetime] = None
     latency_ms: Optional[float] = None
+    is_local: bool = False
 
 
 class MCPManager:
@@ -142,8 +144,14 @@ class MCPManager:
         # Active managed servers (server_id -> ManagedMCPServer)
         self._managed_servers: Dict[str, ManagedMCPServer] = {}
 
+        # IDs of session-scoped local servers (from .code_puppy/mcp_servers.json)
+        self._local_server_ids: set = set()
+
         # Sync servers from mcp_servers.json into registry
         self.sync_from_config()
+
+        # Load project-local servers (session-scoped, bypass registry)
+        self.sync_from_local_config()
 
         # Load existing servers from registry
         self._initialize_servers()
@@ -215,6 +223,70 @@ class MCPManager:
         except Exception as e:
             logger.error(f"Failed to sync from mcp_servers.json: {e}")
             # Don't fail initialization if sync fails
+
+    def _load_local_server_configs(self) -> dict:
+        """Return project-local MCP server configs without side effects.
+
+        Delegates to :func:`code_puppy.config.load_local_mcp_config` which
+        reads from ``.code_puppy/mcp_servers.json`` (workspace) or the legacy
+        ``.code-puppy.json`` file.
+        """
+        try:
+            from code_puppy.config import load_local_mcp_config
+
+            return load_local_mcp_config()
+        except Exception as exc:
+            logger.warning("Failed to load local MCP config: %s", exc)
+            return {}
+
+    def sync_from_local_config(self) -> None:
+        """Load project-local MCP servers into _managed_servers.
+
+        Local servers are session-scoped — they bypass the persistent
+        ``mcp_registry.json`` and live only in ``_managed_servers`` for
+        the lifetime of this process.  Their IDs are tracked in
+        ``_local_server_ids`` so ``list_servers()`` can mark them.
+
+        Skips servers whose name already exists in ``_managed_servers``
+        (global config loaded by ``sync_from_config`` takes precedence
+        on name collisions — users who want to override should remove
+        the global entry).
+        """
+        configs = self._load_local_server_configs()
+        if not configs:
+            return
+
+        # Names already loaded via the global path — skip duplicates
+        existing_names = {ms.config.name for ms in self._managed_servers.values()}
+
+        synced = 0
+        for name, conf in configs.items():
+            if name in existing_names:
+                logger.debug(
+                    "Skipping local server %s: already registered globally",
+                    name,
+                )
+                continue
+
+            try:
+                server_config = ServerConfig(
+                    id=str(uuid.uuid4()),
+                    name=name,
+                    type=conf.get("type", "stdio"),
+                    enabled=conf.get("enabled", True),
+                    config=conf,
+                )
+                managed_server = ManagedMCPServer(server_config)
+                self._managed_servers[server_config.id] = managed_server
+                self._local_server_ids.add(server_config.id)
+                self.status_tracker.set_status(server_config.id, ServerState.STOPPED)
+                synced += 1
+                logger.debug("Loaded local MCP server: %s", name)
+            except Exception as exc:
+                logger.warning("Failed to load local MCP server '%s': %s", name, exc)
+
+        if synced:
+            logger.info("Loaded %d local MCP server(s) from project config", synced)
 
     def _initialize_servers(self) -> None:
         """Initialize managed servers from registry configurations."""
@@ -478,6 +550,7 @@ class MCPManager:
                     health=health_info,
                     start_time=summary.get("start_time"),
                     latency_ms=latency_ms,
+                    is_local=server_id in self._local_server_ids,
                 )
 
                 server_infos.append(server_info)
