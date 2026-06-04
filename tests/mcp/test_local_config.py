@@ -285,3 +285,125 @@ class TestManagerSyncsLocalConfig:
 
         assert "pure-server" in result
         assert result["pure-server"]["command"] == "echo"
+
+
+# ── projectOnly + workspace mcp_servers.json (raft scenario) ───────────────
+
+
+class TestProjectOnlyWorkspaceMcp:
+    """The exact scenario raft creates: projectOnly + .code_puppy/mcp_servers.json.
+
+    When raft scaffolds a project it writes:
+      .code_puppy/config.json   → {"projectOnly": true}
+      .code_puppy/mcp_servers.json → {"mcp_servers": {"stackwright-pro-mcp": {...}}}
+
+    Global config is skipped (projectOnly), so the ONLY source of MCP servers
+    is the workspace file.  This test proves they end up in _managed_servers.
+    """
+
+    def _setup_workspace(self, tmp_path):
+        """Create a minimal raft-style workspace layout."""
+        ws_dir = tmp_path / ".code_puppy"
+        ws_dir.mkdir()
+
+        (ws_dir / "config.json").write_text(json.dumps({"projectOnly": True}))
+        (ws_dir / "mcp_servers.json").write_text(
+            json.dumps(
+                {
+                    "mcp_servers": {
+                        "stackwright-pro-mcp": {
+                            "type": "stdio",
+                            "command": "node",
+                            "args": ["dist/index.js"],
+                            "enabled": True,
+                        }
+                    }
+                }
+            )
+        )
+        return ws_dir
+
+    def test_server_loaded_in_project_only_mode(self, tmp_path):
+        """With projectOnly + workspace mcp_servers.json the server is loaded."""
+        self._setup_workspace(tmp_path)
+
+        empty_global = tmp_path / "global_mcp_servers.json"
+        empty_global.write_text(json.dumps({"mcp_servers": {}}))
+
+        with (
+            patch("code_puppy.config.MCP_SERVERS_FILE", str(empty_global)),
+            patch("os.getcwd", return_value=str(tmp_path)),
+            patch.object(
+                __import__("code_puppy.config", fromlist=["_workspace_cache"]),
+                "_workspace_cache",
+                None,
+            ),
+            patch.object(
+                __import__("code_puppy.config", fromlist=["_workspace_cache_cwd"]),
+                "_workspace_cache_cwd",
+                None,
+            ),
+            patch("code_puppy.mcp_.registry.ServerRegistry._persist"),
+            patch("code_puppy.mcp_.registry.ServerRegistry._load"),
+        ):
+            from code_puppy.mcp_.manager import MCPManager
+
+            manager = MCPManager()
+
+        managed = next(
+            (
+                s
+                for s in manager._managed_servers.values()
+                if s.config.name == "stackwright-pro-mcp"
+            ),
+            None,
+        )
+        assert managed is not None, (
+            "stackwright-pro-mcp should be loaded from workspace mcp_servers.json "
+            "even in projectOnly mode"
+        )
+        assert managed.is_enabled() is True
+
+    def test_global_servers_skipped_in_project_only_mode(self, tmp_path):
+        """Global mcp_servers.json must NOT be loaded in projectOnly mode."""
+        self._setup_workspace(tmp_path)
+
+        global_mcp = tmp_path / "global_mcp_servers.json"
+        global_mcp.write_text(
+            json.dumps(
+                {
+                    "mcp_servers": {
+                        "global-server": {
+                            "type": "sse",
+                            "url": "http://localhost:9999",
+                            "enabled": True,
+                        }
+                    }
+                }
+            )
+        )
+
+        with (
+            patch("code_puppy.config.MCP_SERVERS_FILE", str(global_mcp)),
+            patch("os.getcwd", return_value=str(tmp_path)),
+            patch.object(
+                __import__("code_puppy.config", fromlist=["_workspace_cache"]),
+                "_workspace_cache",
+                None,
+            ),
+            patch.object(
+                __import__("code_puppy.config", fromlist=["_workspace_cache_cwd"]),
+                "_workspace_cache_cwd",
+                None,
+            ),
+            patch("code_puppy.mcp_.registry.ServerRegistry._persist"),
+            patch("code_puppy.mcp_.registry.ServerRegistry._load"),
+        ):
+            from code_puppy.mcp_.manager import MCPManager
+
+            manager = MCPManager()
+
+        # Only the local server should exist, not the global one
+        names = {s.config.name for s in manager._managed_servers.values()}
+        assert "stackwright-pro-mcp" in names
+        assert "global-server" not in names
